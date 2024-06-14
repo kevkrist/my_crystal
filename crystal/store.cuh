@@ -14,10 +14,9 @@ struct BlockStore
                          LoopType::Direct>
       Looper;
 
-    Looper::Execute(
-      [block_itr, &thread_items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
-        block_itr[BLOCK_ITEM] = thread_items[THREAD_ITEM];
-      });
+    Looper::Loop([block_itr, &thread_items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
+      block_itr[BLOCK_ITEM] = thread_items[THREAD_ITEM];
+    });
   }
 
   template <typename OutputIteratorT>
@@ -29,7 +28,7 @@ struct BlockStore
                          LoopType::Guarded>
       Looper;
 
-    Looper::Execute(
+    Looper::Loop(
       [block_itr, &thread_items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
         block_itr[BLOCK_ITEM] = thread_items[THREAD_ITEM];
       },
@@ -47,11 +46,9 @@ struct BlockStore
                          LoopType::Guarded>
       Looper;
 
-    Looper::Execute(
-      [block_itr, &shared_items] __device__(auto BLOCK_ITEM) -> void {
-        block_itr[BLOCK_ITEM] = shared_items[BLOCK_ITEM];
-      },
-      num_items);
+    Looper::Loop([block_itr, &shared_items] __device__(
+                   auto BLOCK_ITEM) -> void { block_itr[BLOCK_ITEM] = shared_items[BLOCK_ITEM]; },
+                 num_items);
   }
 };
 } // namespace crystal

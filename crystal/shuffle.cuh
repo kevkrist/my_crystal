@@ -1,6 +1,7 @@
 #pragma once
 
 #include "loop.cuh"
+#include "store.cuh"
 
 namespace crystal
 {
@@ -30,7 +31,7 @@ struct BlockFlag
                          LoopType::Direct>
       Looper;
 
-    Looper::Execute([&input, &flag_op, &flags] __device__(auto THREAD_ITEM) -> void {
+    Looper::Loop([&input, &flag_op, &flags] __device__(auto THREAD_ITEM) -> void {
       flags[THREAD_ITEM] = flag_op(input[THREAD_ITEM]);
     });
   }
@@ -46,29 +47,34 @@ struct BlockFlag
                          LoopType::Guarded>
       Looper;
 
-    Looper::Execute(
-      [&input, &flag_op, &flags] __device__(auto THREAD_ITEM) -> void {
-        flags[THREAD_ITEM] = flag_op(input[THREAD_ITEM]);
-      },
-      num_items);
+    Looper::Loop([&input, &flag_op, &flags] __device__(
+                   auto THREAD_ITEM) -> void { flags[THREAD_ITEM] = flag_op(input[THREAD_ITEM]); },
+                 num_items);
   }
 };
 
-template <typename T, int32_t BLOCK_THREADS, int32_t ITEMS_PER_THREAD, DataArrangement ArrangementT>
+enum class ShuffleOperator
+{
+  SetBlockItems,
+  ShuffleThreadItems,
+};
+
+template <typename T, int32_t BLOCK_THREADS, int32_t ITEMS_PER_THREAD>
 struct BlockShuffle
 {
-  T* shared_items;
 
   struct TempStorage
   {
     T temp_storage[BLOCK_THREADS * ITEMS_PER_THREAD];
   };
 
-  __device__ BlockShuffle(TempStorage& storage)
+  T (&shared_items)[BLOCK_THREADS * ITEMS_PER_THREAD];
+
+  __device__ explicit BlockShuffle(TempStorage& storage)
       : shared_items{storage.temp_storage}
   {}
 
-  template <typename FlagT, typename OffsetT>
+  template <DataArrangement ArrangementT, typename FlagT, typename OffsetT>
   static __device__ __forceinline__ void
   ShuffleForward(T (&thread_items)[ITEMS_PER_THREAD],
                  FlagT (&thread_flags)[ITEMS_PER_THREAD],
@@ -80,14 +86,32 @@ struct BlockShuffle
                          LoopType::Flagged>
       Looper;
 
-    Looper::Execute(
+    Looper::Loop(
       [&thread_items, &thread_offsets, &shared_items] __device__(auto THREAD_ITEM) -> void {
         shared_items[thread_offsets[THREAD_ITEM]] = thread_items[THREAD_ITEM];
       },
       thread_flags);
   }
 
-  template <typename FlagT, typename OffsetT>
+  template <DataArrangement ArrangementT, typename FlagT, typename OffsetT>
+  static __device__ __forceinline__ void
+  ShuffleForward(FlagT (&thread_flags)[ITEMS_PER_THREAD],
+                 OffsetT (&thread_offsets)[ITEMS_PER_THREAD],
+                 T (&shared_items)[BLOCK_THREADS * ITEMS_PER_THREAD])
+  {
+    typedef LoopExecutor<ITEMS_PER_THREAD,
+                         ThreadAndBlockLoop<BLOCK_THREADS, ArrangementT>,
+                         LoopType::Flagged>
+      Looper;
+
+    Looper::Loop(
+      [&thread_offsets, &shared_items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
+        shared_items[thread_offsets[THREAD_ITEM]] = BLOCK_ITEM;
+      },
+      thread_flags);
+  }
+
+  template <DataArrangement ArrangementT, typename FlagT, typename OffsetT>
   static __device__ __forceinline__ void
   ShuffleForward(T (&thread_items)[ITEMS_PER_THREAD],
                  FlagT (&thread_flags)[ITEMS_PER_THREAD],
@@ -100,13 +124,32 @@ struct BlockShuffle
       Looper;
 
     int32_t counter = 0;
-    Looper::Execute(
+    Looper::Loop(
       [&thread_items, thread_offset, &shared_items, &counter] __device__(auto THREAD_ITEM) -> void {
         shared_items[thread_offset + counter++] = thread_items[THREAD_ITEM];
       },
       thread_flags);
   }
 
+  template <DataArrangement ArrangementT, typename FlagT, typename OffsetT>
+  static __device__ __forceinline__ void
+  ShuffleForward(FlagT (&thread_flags)[ITEMS_PER_THREAD],
+                 OffsetT thread_offset,
+                 T (&shared_items)[BLOCK_THREADS * ITEMS_PER_THREAD])
+  {
+    typedef LoopExecutor<ITEMS_PER_THREAD,
+                         ThreadAndBlockLoop<BLOCK_THREADS, ArrangementT>,
+                         LoopType::Flagged>
+      Looper;
+
+    int32_t counter = 0;
+    Looper::Loop(
+      [thread_offset, &shared_items, &counter] __device__(auto THREAD_ITEM, auto BLOCK_ITEM)
+        -> void { shared_items[thread_offset + counter++] = BLOCK_ITEM; },
+      thread_flags);
+  }
+
+  template <DataArrangement ArrangementT>
   static __device__ __forceinline__ void
   ShuffleBackward(T (&thread_items)[ITEMS_PER_THREAD],
                   T (&shared_items)[BLOCK_THREADS * ITEMS_PER_THREAD],
@@ -117,33 +160,113 @@ struct BlockShuffle
                          LoopType::Guarded>
       Looper;
 
-    Looper::Execute(
+    Looper::Loop(
       [&thread_items, &shared_items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
         thread_items[THREAD_ITEM] = shared_items[BLOCK_ITEM];
       },
       num_items);
   }
 
-  template <typename FlagT, typename OffsetT>
+  template <DataArrangement ForwardArrangementT,
+            DataArrangement BackwardArrangementT,
+            ShuffleOperator ShuffleOpT,
+            typename FlagT,
+            typename OffsetT>
   __device__ __forceinline__ void Shuffle(T (&thread_items)[ITEMS_PER_THREAD],
                                           FlagT (&thread_flags)[ITEMS_PER_THREAD],
                                           OffsetT (&thread_offsets)[ITEMS_PER_THREAD],
                                           int32_t num_items)
   {
-    ShuffleForward(thread_items, thread_flags, thread_offsets, shared_items);
+    if constexpr (ShuffleOpT == ShuffleOperator::SetBlockItems)
+    {
+      ShuffleForward<ForwardArrangementT>(thread_flags, thread_offsets, shared_items);
+    }
+    else
+    {
+      ShuffleForward<ForwardArrangementT>(thread_items, thread_flags, thread_offsets, shared_items);
+    }
     __syncthreads();
-    ShuffleBackward(thread_items, shared_items, num_items);
+    ShuffleBackward<BackwardArrangementT>(thread_items, shared_items, num_items);
   }
 
-  template <typename FlagT, typename OffsetT>
+  template <DataArrangement ForwardArrangementT,
+            DataArrangement BackwardArrangementT,
+            ShuffleOperator ShuffleOpT,
+            typename FlagT,
+            typename OffsetT>
   __device__ __forceinline__ void Shuffle(T (&thread_items)[ITEMS_PER_THREAD],
                                           FlagT (&thread_flags)[ITEMS_PER_THREAD],
                                           OffsetT thread_offset,
                                           int32_t num_items)
   {
-    ShuffleForward(thread_items, thread_flags, thread_offset, shared_items);
+    if constexpr (ShuffleOpT == ShuffleOperator::SetBlockItems)
+    {
+      ShuffleForward<ForwardArrangementT>(thread_flags, thread_offset, shared_items);
+    }
+    else
+    {
+      ShuffleForward<ForwardArrangementT>(thread_items, thread_flags, thread_offset, shared_items);
+    }
     __syncthreads();
-    ShuffleBackward(thread_items, shared_items, num_items);
+    ShuffleBackward<BackwardArrangementT>(thread_items, shared_items, num_items);
+  }
+
+  /**
+   * Shuffles items into shared memory and stores directly from shared memory, saving a
+   * ShuffleBackward operation.
+   * @tparam ArrangementT The arrangement of data in the tile
+   * @tparam OutputIteratorT The type of the output iterator to which to store.
+   * @tparam FlagT The type of the flags used to indicate items to shuffle.
+   * @tparam OffsetT The type of the offset by which to increment the output iterator.
+   * @param block_itr The output iterator to which to store.
+   * @param thread_items The items to shuffle and store.
+   * @param thread_flags The flags indicating items to shuffle and store.
+   * @param thread_offsets The offsets at which to store for each item.
+   * @param num_items The number of items to store.
+   */
+  template <DataArrangement ArrangementT,
+            typename OutputIteratorT,
+            typename FlagT,
+            typename OffsetT>
+  __device__ __forceinline__ void ShuffleStore(OutputIteratorT block_itr,
+                                               T (&thread_items)[ITEMS_PER_THREAD],
+                                               FlagT (&thread_flags)[ITEMS_PER_THREAD],
+                                               OffsetT (&thread_offsets)[ITEMS_PER_THREAD],
+                                               int32_t num_items)
+  {
+    typedef BlockStore<T, BLOCK_THREADS, ITEMS_PER_THREAD, ArrangementT> BlockStore;
+
+    ShuffleForward<ArrangementT>(thread_items, thread_flags, thread_offsets, shared_items);
+    __syncthreads();
+    BlockStore::StoreShared(block_itr, shared_items, num_items);
+  }
+
+  /**
+   * Shuffles (implicit) row ids into shared memory and stores directly from shared memory, saving a
+   * ShuffleBackward operation.
+   * @tparam ArrangementT The arrangement of data in the tile
+   * @tparam OutputIteratorT The type of the output iterator to which to store.
+   * @tparam FlagT The type of the flags used to indicate items to shuffle.
+   * @tparam OffsetT The type of the offset by which to increment the output iterator.
+   * @param block_itr The output iterator to which to store.
+   * @param thread_flags The flags indicating items to shuffle and store.
+   * @param thread_offsets The offsets at which to store for each item.
+   * @param num_items The number of items to store.
+   */
+  template <DataArrangement ArrangementT,
+            typename OutputIteratorT,
+            typename FlagT,
+            typename OffsetT>
+  __device__ __forceinline__ void ShuffleStore(OutputIteratorT block_itr,
+                                               FlagT (&thread_flags)[ITEMS_PER_THREAD],
+                                               OffsetT (&thread_offsets)[ITEMS_PER_THREAD],
+                                               int32_t num_items)
+  {
+    typedef BlockStore<T, BLOCK_THREADS, ITEMS_PER_THREAD, ArrangementT> BlockStore;
+
+    ShuffleForward<ArrangementT>(thread_flags, thread_offsets, shared_items);
+    __syncthreads();
+    BlockStore::StoreShared(block_itr, shared_items, num_items);
   }
 };
 

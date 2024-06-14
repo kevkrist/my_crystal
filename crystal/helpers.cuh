@@ -26,4 +26,9 @@ namespace crystal
     }
   }
 
+  template<int32_t BLOCK_THREADS, int ITEMS_PER_THREAD>
+  __device__ __forceinline__ size_t ComputeGlobalItem(int32_t BLOCK_ID, int32_t BLOCK_ITEM) {
+    return BLOCK_ID * BLOCK_THREADS * ITEMS_PER_THREAD + BLOCK_ITEM;
+  }
+
 } // namespace crystal

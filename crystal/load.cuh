@@ -35,7 +35,7 @@ struct BlockLoad
                          LoopType::Direct>
       Looper;
 
-    Looper::Execute([block_itr, &items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
+    Looper::Loop([block_itr, &items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
       items[THREAD_ITEM] = block_itr[BLOCK_ITEM];
     });
   }
@@ -49,7 +49,7 @@ struct BlockLoad
                          LoopType::Guarded>
       Looper;
 
-    Looper::Execute(
+    Looper::Loop(
       [block_itr, &items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
         items[THREAD_ITEM] = block_itr[BLOCK_ITEM];
       },
@@ -66,7 +66,7 @@ struct BlockLoad
                          LoopType::Direct>
       Looper;
 
-    Looper::Execute([block_itr, &offsets, &items] __device__(auto THREAD_ITEM) -> void {
+    Looper::Loop([block_itr, &offsets, &items] __device__(auto THREAD_ITEM) -> void {
       items[THREAD_ITEM] = block_itr[offsets[THREAD_ITEM]];
     });
   }
@@ -82,7 +82,7 @@ struct BlockLoad
                          LoopType::Guarded>
       Looper;
 
-    Looper::Execute(
+    Looper::Loop(
       [block_itr, &offsets, &items] __device__(auto THREAD_ITEM) -> void {
         items[THREAD_ITEM] = block_itr[offsets[THREAD_ITEM]];
       },
@@ -99,7 +99,7 @@ struct BlockLoad
                          LoopType::Flagged>
       Looper;
 
-    Looper::Execute(
+    Looper::Loop(
       [block_itr, &items] __device__(auto THREAD_ITEM, auto BLOCK_ITEM) -> void {
         items[THREAD_ITEM] = block_itr[BLOCK_ITEM];
       },

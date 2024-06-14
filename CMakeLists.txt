@@ -40,4 +40,6 @@ set(CMAKE_CUDA_FLAGS
 SET(CUB_TEST_UTILS "${CMAKE_BINARY_DIR}/_deps/cccl-src/cub/test"
         CACHE PATH "Path to CUB's test utils")
 
+# Add subdirectories
 add_subdirectory(test)
+add_subdirectory(eval)

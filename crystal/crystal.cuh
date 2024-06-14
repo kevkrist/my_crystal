@@ -5,3 +5,4 @@
 #include "scan.cuh"
 #include "shuffle.cuh"
 #include "store.cuh"
+#include "kernels/select.cuh"
