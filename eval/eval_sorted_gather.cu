@@ -9,11 +9,10 @@
 #include <thrust/host_vector.h>
 #include <thrust/sequence.h>
 
-constexpr int32_t block_threads    = 128;
-constexpr int32_t items_per_thread = 4;
-constexpr int32_t seed             = 0;
-// Possible selectivities: 50%, 33%, 25%, 20%, 10%, 5%
-thrust::host_vector<int32_t> possible_inverse_selectivities = {2, 3, 4, 5, 10, 20, 40};
+constexpr int32_t block_threads                             = 128;
+constexpr int32_t items_per_thread                          = 4;
+constexpr int32_t seed                                      = 0;
+thrust::host_vector<int32_t> possible_inverse_selectivities = {2, 4, 8, 16, 32, 64};
 
 //--------------------------------------------------------------------------------------------------
 // Functors
@@ -124,6 +123,7 @@ __global__ void GatherKernel(InputIt input, OffsetIt offsets, OutputIt output, i
   OffsetT thread_offsets[items_per_thread];
   KernelConfig kernel_config(blockIdx.x, num_in);
 
+  // Do stuff
   if (!kernel_config.is_last_tile)
   {
     BlockLoadOffsets::Load(offsets + kernel_config.block_offset, thread_offsets);
@@ -151,9 +151,13 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
   thrust::device_vector<int32_t> row_ids_out_sorted(output_size);
   thrust::device_vector<int32_t> row_ids_out_unsorted(output_size);
   thrust::device_vector<int32_t> row_ids_out_random(output_size);
+  thrust::device_vector<int32_t> row_ids_out_double_1(2 * output_size);
+  thrust::device_vector<int32_t> row_ids_out_double_2(output_size);
   thrust::host_vector<int32_t> row_ids_out_random_host(output_size);
+  thrust::device_vector<int32_t> stencil_buffer(2 * output_size);
   thrust::device_vector<int32_t> gathered_data_sorted(output_size);
   thrust::device_vector<int32_t> gathered_data_unsorted(output_size);
+  thrust::device_vector<int32_t> gathered_data_double(output_size);
   thrust::device_vector<int32_t> gathered_data_random(output_size);
 
   // Initialize row ids
@@ -185,6 +189,8 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
     // Initialize counters
     thrust::device_vector<int32_t> num_out_unsorted(1);
     thrust::device_vector<int32_t> num_out_sorted(1);
+    thrust::device_vector<int32_t> num_out_double_1(1);
+    thrust::device_vector<int32_t> num_out_double_2(1);
 
     // Cub order-preserving compaction
     uint8_t* temp_storage     = nullptr;
@@ -219,7 +225,33 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
       thrust::raw_pointer_cast(num_out_unsorted.data()));
     CubDebugExit(cudaDeviceSynchronize());
 
-    // Generate completely random sequence of row ids
+    // Crystal non-order-preserving double compaction
+    // NOTE: this is not the most performant way to do this, but it is the most convenient, and
+    // we aren't evaluating the performance of this kernel here.
+    auto input_iter = thrust::make_zip_iterator(row_ids_in.begin(), stencil.begin());
+    auto output_iter =
+      thrust::make_zip_iterator(row_ids_out_double_1.begin(), stencil_buffer.begin());
+    UnorderedSelectionKernel<<<blocks_in_grid, block_threads>>>( // First compaction
+      input_iter,
+      stencil.begin(),
+      SelectOp{inverse_selectivity / 2},
+      num_input,
+      output_iter,
+      thrust::raw_pointer_cast(num_out_double_1.data()));
+    CubDebugExit(cudaDeviceSynchronize());
+    int32_t num_out_double_1_host = num_out_double_1[0]; // Copy to host for DivideAndRoundUp
+    int32_t blocks_in_second_grid =
+      cub::DivideAndRoundUp(num_out_double_1_host, block_threads * items_per_thread);
+    UnorderedSelectionKernel<<<blocks_in_second_grid, block_threads>>>( // Second compaction
+      row_ids_out_double_1.begin(),
+      stencil_buffer.begin(),
+      SelectOp{inverse_selectivity},
+      num_out_double_1_host,
+      row_ids_out_double_2.begin(),
+      thrust::raw_pointer_cast(num_out_double_2.data()));
+    CubDebugExit(cudaDeviceSynchronize());
+
+    // Generate a completely random sequence of row ids
     thrust::copy(row_ids_out_sorted.begin(),
                  row_ids_out_sorted.end(),
                  row_ids_out_random_host.begin());
@@ -229,27 +261,29 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
                  row_ids_out_random.begin());
 
     // Sanity check that the outputs are the same size
-    if (num_out_sorted[0] != num_out_unsorted[0] || num_out_sorted[0] != output_size)
+    if (num_out_sorted[0] != num_out_unsorted[0] || num_out_sorted[0] != num_out_double_2[0] ||
+        num_out_sorted[0] != output_size)
     {
-      std::cerr << "Kernels produced inconsistent output sizes (cub / crystal / expected): "
-                << num_out_sorted[0] << " / " << num_out_unsorted[0] << " / " << output_size
-                << "\n";
+      std::cerr << "Kernels produced inconsistent output sizes (cub / crystal / crystal double / "
+                   "expected): "
+                << num_out_sorted[0] << " / " << num_out_unsorted[0] << " / " << num_out_double_2[0]
+                << " / " << output_size << "\n";
       exit(EXIT_FAILURE);
     }
 
     // Thrust gathers
-    auto sorted_gather_iter =
-      thrust::make_permutation_iterator(stencil.begin(), row_ids_out_sorted.begin());
-    auto unsorted_gather_iter =
-      thrust::make_permutation_iterator(stencil.begin(), row_ids_out_unsorted.begin());
-    thrust::copy(sorted_gather_iter,
-                 sorted_gather_iter + num_out_sorted[0],
-                 gathered_data_sorted.begin());
-    CubDebugExit(cudaDeviceSynchronize());
-    thrust::copy(unsorted_gather_iter,
-                 unsorted_gather_iter + num_out_unsorted[0],
-                 gathered_data_unsorted.begin());
-    CubDebugExit(cudaDeviceSynchronize());
+    //    auto sorted_gather_iter =
+    //      thrust::make_permutation_iterator(stencil.begin(), row_ids_out_sorted.begin());
+    //    auto unsorted_gather_iter =
+    //      thrust::make_permutation_iterator(stencil.begin(), row_ids_out_unsorted.begin());
+    //    thrust::copy(sorted_gather_iter,
+    //                 sorted_gather_iter + num_out_sorted[0],
+    //                 gathered_data_sorted.begin());
+    //    CubDebugExit(cudaDeviceSynchronize());
+    //    thrust::copy(unsorted_gather_iter,
+    //                 unsorted_gather_iter + num_out_unsorted[0],
+    //                 gathered_data_unsorted.begin());
+    //    CubDebugExit(cudaDeviceSynchronize());
 
     // Custom gathers
     int32_t blocks_in_gather_grid =
@@ -262,6 +296,11 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
     GatherKernel<<<blocks_in_gather_grid, block_threads>>>(stencil.begin(),
                                                            row_ids_out_unsorted.begin(),
                                                            gathered_data_unsorted.begin(),
+                                                           output_size);
+    CubDebugExit(cudaDeviceSynchronize());
+    GatherKernel<<<blocks_in_gather_grid, block_threads>>>(stencil.begin(),
+                                                           row_ids_out_double_2.begin(),
+                                                           gathered_data_double.begin(),
                                                            output_size);
     CubDebugExit(cudaDeviceSynchronize());
     GatherKernel<<<blocks_in_gather_grid, block_threads>>>(stencil.begin(),
