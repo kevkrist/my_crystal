@@ -8,16 +8,18 @@
 #include <thrust/random.h>
 #include <thrust/sequence.h>
 
-constexpr int32_t seed                 = 0;
-constexpr int32_t default_num_items    = 1 << 26;
+constexpr int32_t seed = 0;
+constexpr int32_t default_num_items = 1 << 28;
 constexpr int32_t default_random_bound = 100;
-constexpr int32_t block_threads        = 128;
-constexpr int32_t items_per_thread     = 4;
+constexpr int32_t block_threads = 128;
+constexpr int32_t items_per_thread = 4;
 
-// Selection predicate
+//--------------------------------------------------------------------------------------------------
+// Functors
+//--------------------------------------------------------------------------------------------------
 struct SelectOp : thrust::unary_function<int32_t, bool>
 {
-  __host__ __device__ __forceinline__ bool operator()(const int32_t& value) const
+  __host__ __device__ __forceinline__ bool operator()(const int32_t &value) const
   {
     return value == 0;
   }
@@ -28,9 +30,9 @@ struct RandUniformOp
 {
   int32_t min, max;
   __host__ __device__ RandUniformOp(int32_t min, int32_t max)
-      : min{min}
-      , max{max}
-  {}
+      : min{min}, max{max}
+  {
+  }
 
   __host__ __device__ int32_t operator()(uint32_t index) const
   {
@@ -41,7 +43,9 @@ struct RandUniformOp
   }
 };
 
-// Sweep selectivities
+//--------------------------------------------------------------------------------------------------
+// Sweep functions
+//--------------------------------------------------------------------------------------------------
 void SweepSelectivity(int32_t num_selectivities)
 {
   // Sweep selectivities 1, 1/2, ..., 1/num_selectivities
@@ -59,12 +63,12 @@ void SweepSelectivity(int32_t num_selectivities)
   // Initialize stencil vector
   thrust::device_vector<int32_t> stencil(default_num_items);
 
-  // Initialize output buffer
+  // Initialize output buffers
   thrust::device_vector<int32_t> output(default_num_items);
 
   // Allocate cub resources
   thrust::device_vector<int32_t> num_out_cub_vector(1);
-  uint8_t* temp_storage     = nullptr;
+  uint8_t *temp_storage = nullptr;
   size_t temp_storage_bytes = 0;
   cub::DeviceSelect::FlaggedIf(temp_storage,
                                temp_storage_bytes,
@@ -77,9 +81,9 @@ void SweepSelectivity(int32_t num_selectivities)
   CubDebugExit(cudaMalloc(&temp_storage, temp_storage_bytes));
 
   // Allocate crystal resources
-  uint8_t* temp_storage_crystal     = nullptr;
+  uint8_t *temp_storage_crystal = nullptr;
   size_t temp_storage_crystal_bytes = 0;
-  int32_t num_out                   = 0;
+  int32_t num_out = 0;
   crystal::DeviceSelect::Select<block_threads, items_per_thread>(temp_storage_crystal,
                                                                  temp_storage_crystal_bytes,
                                                                  input.begin(),
@@ -101,6 +105,20 @@ void SweepSelectivity(int32_t num_selectivities)
                       stencil.begin(),
                       RandUniformOp{0, inverse_selectivity});
 
+    // Crystal
+    crystal::DeviceSelect::Select<block_threads, items_per_thread>(temp_storage_crystal,
+                                                                   temp_storage_crystal_bytes,
+                                                                   input.begin(),
+                                                                   stencil.begin(),
+                                                                   SelectOp{},
+                                                                   default_num_items,
+                                                                   output.begin(),
+                                                                   num_out);
+
+    CubDebugExit(cudaDeviceSynchronize());
+
+    std::cout << "Finished crystal.\n";
+
     // Cub
     cub::DeviceSelect::FlaggedIf(temp_storage,
                                  temp_storage_bytes,
@@ -113,17 +131,7 @@ void SweepSelectivity(int32_t num_selectivities)
 
     CubDebugExit(cudaDeviceSynchronize());
 
-    // Crystal
-    crystal::DeviceSelect::Select<block_threads, items_per_thread>(temp_storage_crystal,
-                                                                   temp_storage_crystal_bytes,
-                                                                   input.begin(),
-                                                                   stencil.begin(),
-                                                                   SelectOp{},
-                                                                   default_num_items,
-                                                                   output.begin(),
-                                                                   num_out);
-
-    CubDebugExit(cudaDeviceSynchronize());
+    std::cout << "Finished cub.\n";
   }
 
   // Free cub temp storage
@@ -134,7 +142,10 @@ void SweepSelectivity(int32_t num_selectivities)
   }
 }
 
-int main(int argc, char** argv)
+//--------------------------------------------------------------------------------------------------
+// Main
+//--------------------------------------------------------------------------------------------------
+int main(int argc, char **argv)
 {
   // Gather command-line args
   int32_t num_selectivities = 0;

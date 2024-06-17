@@ -9,9 +9,10 @@
 #include <thrust/host_vector.h>
 #include <thrust/sequence.h>
 
-constexpr int32_t block_threads                             = 128;
-constexpr int32_t items_per_thread                          = 4;
-constexpr int32_t seed                                      = 0;
+constexpr int32_t block_threads    = 128;
+constexpr int32_t items_per_thread = 4;
+constexpr int32_t seed             = 0;
+// Possible selectivities: 50%, 33%, 25%, 20%, 10%, 5%
 thrust::host_vector<int32_t> possible_inverse_selectivities = {2, 3, 4, 5, 10, 20, 40};
 
 //--------------------------------------------------------------------------------------------------
@@ -149,8 +150,11 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
   // Initialize output buffers
   thrust::device_vector<int32_t> row_ids_out_sorted(output_size);
   thrust::device_vector<int32_t> row_ids_out_unsorted(output_size);
+  thrust::device_vector<int32_t> row_ids_out_random(output_size);
+  thrust::host_vector<int32_t> row_ids_out_random_host(output_size);
   thrust::device_vector<int32_t> gathered_data_sorted(output_size);
   thrust::device_vector<int32_t> gathered_data_unsorted(output_size);
+  thrust::device_vector<int32_t> gathered_data_random(output_size);
 
   // Initialize row ids
   thrust::device_vector<int32_t> row_ids_in(output_size * max_inverse_selectivity);
@@ -182,7 +186,7 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
     thrust::device_vector<int32_t> num_out_unsorted(1);
     thrust::device_vector<int32_t> num_out_sorted(1);
 
-    // Cub
+    // Cub order-preserving compaction
     uint8_t* temp_storage     = nullptr;
     size_t temp_storage_bytes = 0;
     cub::DeviceSelect::FlaggedIf(temp_storage,
@@ -204,7 +208,7 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
                                  SelectOp{inverse_selectivity});
     CubDebugExit(cudaDeviceSynchronize());
 
-    // Crystal
+    // Crystal non-order-preserving compaction
     int32_t blocks_in_grid = cub::DivideAndRoundUp(num_input, block_threads * items_per_thread);
     UnorderedSelectionKernel<<<blocks_in_grid, block_threads>>>(
       row_ids_in.begin(),
@@ -215,7 +219,16 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
       thrust::raw_pointer_cast(num_out_unsorted.data()));
     CubDebugExit(cudaDeviceSynchronize());
 
-    // Check that the outputs are the same size
+    // Generate completely random sequence of row ids
+    thrust::copy(row_ids_out_sorted.begin(),
+                 row_ids_out_sorted.end(),
+                 row_ids_out_random_host.begin());
+    std::shuffle(row_ids_out_random_host.begin(), row_ids_out_random_host.end(), rng);
+    thrust::copy(row_ids_out_random_host.begin(),
+                 row_ids_out_random_host.end(),
+                 row_ids_out_random.begin());
+
+    // Sanity check that the outputs are the same size
     if (num_out_sorted[0] != num_out_unsorted[0] || num_out_sorted[0] != output_size)
     {
       std::cerr << "Kernels produced inconsistent output sizes (cub / crystal / expected): "
@@ -223,11 +236,6 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
                 << "\n";
       exit(EXIT_FAILURE);
     }
-
-//    DisplayDeviceResults(thrust::raw_pointer_cast(row_ids_out_sorted.data()), 20);
-//    std::cout << "\n\n";
-//    DisplayDeviceResults(thrust::raw_pointer_cast(row_ids_out_unsorted.data()), 20);
-//    std::cout << "\n\n";
 
     // Thrust gathers
     auto sorted_gather_iter =
@@ -256,6 +264,11 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
                                                            gathered_data_unsorted.begin(),
                                                            output_size);
     CubDebugExit(cudaDeviceSynchronize());
+    GatherKernel<<<blocks_in_gather_grid, block_threads>>>(stencil.begin(),
+                                                           row_ids_out_random.begin(),
+                                                           gathered_data_random.begin(),
+                                                           output_size);
+    CubDebugExit(cudaDeviceSynchronize());
 
     // Free explicitly allocated resources
     if (temp_storage)
@@ -275,7 +288,7 @@ int main(int argc, char** argv)
 {
   // Gather command-line args
   int32_t max_inverse_selectivity = 0;
-  int32_t output_size             = 1 << 26;
+  int32_t output_size             = 1 << 22;
   CommandLineArgs args(argc, argv);
   args.GetCmdLineArgument("mis", max_inverse_selectivity);
   args.GetCmdLineArgument("os", output_size);

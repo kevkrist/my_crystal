@@ -84,6 +84,7 @@ __global__ void SelectKernel(cub::ScanTileState<CounterT> tile_state,
     if (threadIdx.x == 0)
     {
       tile_state.SetInclusive(block_id, num_selected);
+      write_offset = 0;
     }
   }
   else
@@ -92,12 +93,17 @@ __global__ void SelectKernel(cub::ScanTileState<CounterT> tile_state,
     {
       // Collect exclusive aggregate from previous tiles and publish inclusive aggregate for
       // subsequent tiles.
-      write_offset = prefix_op(num_selected);
+      CounterT local_write_offset = prefix_op(num_selected);
 
-      // If last tile, set num_out
-      if (config.is_last_tile && threadIdx.x == 0)
-      {
-        *num_out = scan_op(write_offset, num_selected);
+      if(threadIdx.x == 0) {
+        // Set shared write_offset
+        write_offset = local_write_offset;
+
+        // If last tile, set num_out
+        if (config.is_last_tile && threadIdx.x == 0)
+        {
+          *num_out = scan_op(local_write_offset, num_selected);
+        }
       }
     }
   }
