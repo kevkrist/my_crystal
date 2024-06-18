@@ -167,6 +167,23 @@ struct BlockShuffle
       num_items);
   }
 
+  /**
+   * The Shuffle operator compacts a tile of data in ForwardArrangementT, filtered by flags, into
+   * a sequential tile of data in BackwardArrangmentT. Shared memory of size
+   *    size(T) * ITEMS_PER_THREAD * BLOCK_THREADS
+   * is required. This overload assumes the offsets are stored in an array corresponding to the
+   * items to shuffle.
+   * @tparam ForwardArrangementT The arrangement of the data before compaction
+   * @tparam BackwardArrangementT The arrangement of the data after compaction
+   * @tparam ShuffleOpT The shuffle operator type (among {SetBlockItems, ShuffleThreadItems}).
+   * @tparam FlagT The type of the thread flags
+   * @tparam OffsetT The type the offsets (likely prefix sums) at which to store items in shared
+   * memory
+   * @param thread_items The items to shuffle
+   * @param thread_flags The selection flags
+   * @param thread_offsets The offsets at which to store items in shared memory
+   * @param num_items The number of valid tile items to shuffle (necessary for backward shuffle)
+   */
   template <DataArrangement ForwardArrangementT,
             DataArrangement BackwardArrangementT,
             ShuffleOperator ShuffleOpT,
@@ -189,6 +206,23 @@ struct BlockShuffle
     ShuffleBackward<BackwardArrangementT>(thread_items, shared_items, num_items);
   }
 
+  /**
+   * The Shuffle operator compacts a tile of data in ForwardArrangementT, filtered by flags, into
+   * a sequential tile of data in BackwardArrangmentT. Shared memory of size
+   *    size(T) * ITEMS_PER_THREAD * BLOCK_THREADS
+   * is required. This overload assumes the offset is simply the starting location in shared memory
+   * at which each thread is to begin writing its local flagged items.
+   * @tparam ForwardArrangementT The arrangement of the data before compaction
+   * @tparam BackwardArrangementT The arrangement of the data after compaction
+   * @tparam ShuffleOpT The shuffle operator type (among {SetBlockItems, ShuffleThreadItems}).
+   * @tparam FlagT The type of the thread flags
+   * @tparam OffsetT The type of the offset (likely a prefix sum) at which to begin storing items
+   * in shared memory
+   * @param thread_items The items to shuffle
+   * @param thread_flags The selection flags
+   * @param thread_offset The offset at which to begin storing items in shared memory
+   * @param num_items The number of valid tile items to shuffle (necessary for backward shuffle)
+   */
   template <DataArrangement ForwardArrangementT,
             DataArrangement BackwardArrangementT,
             ShuffleOperator ShuffleOpT,
@@ -215,14 +249,14 @@ struct BlockShuffle
    * Shuffles items into shared memory and stores directly from shared memory, saving a
    * ShuffleBackward operation.
    * @tparam ArrangementT The arrangement of data in the tile
-   * @tparam OutputIteratorT The type of the output iterator to which to store.
-   * @tparam FlagT The type of the flags used to indicate items to shuffle.
-   * @tparam OffsetT The type of the offset by which to increment the output iterator.
-   * @param block_itr The output iterator to which to store.
-   * @param thread_items The items to shuffle and store.
-   * @param thread_flags The flags indicating items to shuffle and store.
-   * @param thread_offsets The offsets at which to store for each item.
-   * @param num_items The number of items to store.
+   * @tparam OutputIteratorT The type of the output iterator to which to store
+   * @tparam FlagT The type of the flags used to indicate items to shuffle
+   * @tparam OffsetT The type of the offset by which to increment the output iterator
+   * @param block_itr The output iterator to which to store
+   * @param thread_items The items to shuffle and store
+   * @param thread_flags The flags indicating items to shuffle and store
+   * @param thread_offsets The offsets at which to store for each item
+   * @param num_items The number of items to store
    */
   template <DataArrangement ArrangementT,
             typename OutputIteratorT,
