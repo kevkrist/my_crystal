@@ -198,14 +198,14 @@ __global__ void DoubleUnorderedSelectionKernel(InputIt input,
                                                      thread_input,
                                                      thread_flags,
                                                      prefix_sums,
-                                                     num_selected);
+                                                     num_final);
   __syncthreads(); // For temp_shuffle_storage
   BlockShuffleStencil(temp_shuffle_storage.stencil)
     .ShuffleStore<crystal::DataArrangement::Striped>(stencil_output + write_offset,
                                                      thread_stencil,
                                                      thread_flags,
                                                      prefix_sums,
-                                                     num_selected);
+                                                     num_final);
 }
 
 template <typename InputIt, typename OffsetIt, typename OutputIt>
@@ -375,7 +375,7 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
     CubDebugExit(cudaDeviceSynchronize());
     int32_t num_out_triple_1_host = num_out_triple_1[0]; // Copy to host for DivideAndRoundUp
     blocks_in_second_grid =
-      cub::DivideAndRoundUp(num_out_double_1_host, block_threads * items_per_thread);
+      cub::DivideAndRoundUp(num_out_triple_1_host, block_threads * items_per_thread);
     UnorderedSelectionKernel<<<blocks_in_second_grid, block_threads>>>( // Second compaction
       row_ids_out_triple_1.begin(),
       stencil_buffer_triple.begin(),
@@ -399,9 +399,9 @@ void SweepSelectivity(int32_t max_inverse_selectivity, int32_t output_size)
         num_out_sorted[0] != num_out_triple_2[0] || num_out_sorted[0] != output_size)
     {
       std::cerr << "Kernels produced inconsistent output sizes (cub / crystal / crystal double / "
-                   "expected): "
+                   "crystal triple / expected): "
                 << num_out_sorted[0] << " / " << num_out_unsorted[0] << " / " << num_out_double_2[0]
-                << " / " << output_size << "\n";
+                << " / " << num_out_triple_2[0] << " / " << output_size << "\n";
       exit(EXIT_FAILURE);
     }
 
