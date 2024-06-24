@@ -9,6 +9,7 @@
 namespace crystal
 {
 
+// TODO: clean up usage of CounterT vs. int32_t
 template <int32_t BLOCK_THREADS,
           int32_t ITEMS_PER_THREAD,
           typename CounterT,
@@ -38,7 +39,7 @@ __global__ void SelectKernel(cub::ScanTileState<CounterT> tile_state,
   typedef BlockLoad<InputT, BLOCK_THREADS, ITEMS_PER_THREAD, DataArrangement::Striped>
     BlockLoadInput;
   typedef cub::Sum ScanOpT;
-  typedef cub::ScanTileState<int32_t> ScanTileStateT;
+  typedef cub::ScanTileState<CounterT> ScanTileStateT;
   typedef cub::TilePrefixCallbackOp<int32_t, ScanOpT, ScanTileStateT> TilePrefixOpT;
   typedef KernelConfig<BLOCK_THREADS, ITEMS_PER_THREAD> KernelConfigT;
 
