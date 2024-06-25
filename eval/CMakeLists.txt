@@ -3,6 +3,8 @@ list(APPEND EXECUTABLES eval_select)
 list(APPEND SOURCE_FILES eval_select.cu)
 list(APPEND EXECUTABLES eval_sorted_gather)
 list(APPEND SOURCE_FILES eval_sorted_gather.cu)
+list(APPEND EXECUTABLES eval_ordered_compaction)
+list(APPEND SOURCE_FILES eval_ordered_compaction.cu)
 
 # Loop over name / sourcefile pairs
 foreach(exe_name source_file IN ZIP_LISTS EXECUTABLES SOURCE_FILES)

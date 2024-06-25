@@ -12,7 +12,7 @@
 constexpr int32_t block_threads                             = 128;
 constexpr int32_t items_per_thread                          = 6;
 constexpr int32_t seed                                      = 0;
-constexpr size_t min_output_size                            = 1 << 10;
+constexpr size_t min_output_size                            = 1 << 17;
 thrust::host_vector<int32_t> possible_inverse_selectivities = {2, 4, 8, 12, 16, 24, 32, 64};
 
 //--------------------------------------------------------------------------------------------------
@@ -252,7 +252,7 @@ __global__ void GatherKernel(InputIt input, OffsetIt offsets, OutputIt output, s
 //--------------------------------------------------------------------------------------------------
 // Sweep functions
 //--------------------------------------------------------------------------------------------------
-void SweepSelectivity(int32_t max_inverse_selectivity,
+void Sweep(int32_t max_inverse_selectivity,
                       int32_t max_output_size,
                       bool fix_inverse_selectivity,
                       bool fix_output_size)
@@ -305,7 +305,7 @@ void SweepSelectivity(int32_t max_inverse_selectivity,
     }
 
     // Sweep over selectivities
-    while (inverse_selectivity_iter < max_possible_inverse_selectivity &&
+    while (inverse_selectivity_iter <= max_possible_inverse_selectivity &&
            *inverse_selectivity_iter <= max_inverse_selectivity)
     {
       int32_t inverse_selectivity = *inverse_selectivity_iter;
@@ -478,8 +478,8 @@ void SweepSelectivity(int32_t max_inverse_selectivity,
 int main(int argc, char** argv)
 {
   // Gather command-line args
-  int32_t max_inverse_selectivity = 0;
-  int32_t max_output_size         = 1 << 22;
+  int32_t max_inverse_selectivity = 64;
+  int32_t max_output_size         = 1 << 24;
   CommandLineArgs args(argc, argv);
   args.GetCmdLineArgument("mis", max_inverse_selectivity);
   args.GetCmdLineArgument("mos", max_output_size);
@@ -495,14 +495,8 @@ int main(int argc, char** argv)
     return 0;
   }
 
-  // Sweep selectivities
-  if (max_inverse_selectivity > 0)
-  {
-    SweepSelectivity(max_inverse_selectivity,
-                     max_output_size,
-                     fix_inverse_selectivity,
-                     fix_output_size);
-  }
+  // Sweep
+  Sweep(max_inverse_selectivity, max_output_size, fix_inverse_selectivity, fix_output_size);
 
   return 0;
 }
