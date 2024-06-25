@@ -3,149 +3,223 @@
 #include "crystal.cuh"
 #include "test_util.h"
 #include <cub/cub.cuh>
+#include <iostream>
+#include <random>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <thrust/random.h>
 #include <thrust/sequence.h>
 
-constexpr int32_t seed = 0;
-constexpr int32_t default_num_items = 1 << 28;
-constexpr int32_t default_random_bound = 100;
-constexpr int32_t block_threads = 128;
-constexpr int32_t items_per_thread = 4;
+constexpr int32_t seed                                      = 0;
+constexpr int32_t default_num_items                         = 1 << 26;
+constexpr int32_t block_threads                             = 128;
+constexpr int32_t items_per_thread                          = 4;
+thrust::host_vector<int32_t> possible_inverse_selectivities = {2, 4, 8, 12, 16, 24, 32, 64};
 
 //--------------------------------------------------------------------------------------------------
 // Functors
 //--------------------------------------------------------------------------------------------------
 struct SelectOp : thrust::unary_function<int32_t, bool>
 {
-  __host__ __device__ __forceinline__ bool operator()(const int32_t &value) const
-  {
-    return value == 0;
-  }
-};
+  int32_t mod;
 
-// Random functor
-struct RandUniformOp
-{
-  int32_t min, max;
-  __host__ __device__ RandUniformOp(int32_t min, int32_t max)
-      : min{min}, max{max}
-  {
-  }
+  __host__ __device__ explicit SelectOp(int32_t mod)
+      : mod{mod}
+  {}
 
-  __host__ __device__ int32_t operator()(uint32_t index) const
+  __host__ __device__ __forceinline__ bool operator()(const int32_t& value) const
   {
-    thrust::default_random_engine rng(seed);
-    rng.discard(index);
-    thrust::uniform_int_distribution<int32_t> dist(min, max);
-    return dist(rng);
+    return (value % mod) == 0;
   }
 };
 
 //--------------------------------------------------------------------------------------------------
-// Sweep functions
+// Kernels
 //--------------------------------------------------------------------------------------------------
-void SweepSelectivity(int32_t num_selectivities)
+template <int32_t BLOCK_THREADS,
+          int32_t ITEMS_PER_THREAD,
+          typename CounterT,
+          typename InputIt,
+          typename StencilIt,
+          typename Predicate,
+          typename OutputIt>
+__global__ void UnorderedSelectKernel(InputIt input,
+                                      StencilIt stencil,
+                                      Predicate predicate,
+                                      size_t num_in,
+                                      OutputIt output,
+                                      CounterT* num_out)
 {
-  // Sweep selectivities 1, 1/2, ..., 1/num_selectivities
-  thrust::host_vector<int32_t> inverse_selectivities(num_selectivities);
-  thrust::sequence(inverse_selectivities.begin(), inverse_selectivities.end(), 1);
+  // Typedefs
+  typedef typename thrust::iterator_traits<InputIt>::value_type InputT;
+  typedef typename thrust::iterator_traits<StencilIt>::value_type StencilT;
+  typedef typename thrust::iterator_traits<OutputIt>::value_type OutputT;
+  typedef cub::BlockLoad<StencilT, BLOCK_THREADS, ITEMS_PER_THREAD, cub::BLOCK_LOAD_VECTORIZE>
+    BlockLoadStencil;
+  typedef cub::BlockScan<int32_t, BLOCK_THREADS> BlockScan;
+  typedef cub::BlockStore<OutputT, BLOCK_THREADS, ITEMS_PER_THREAD, cub::BLOCK_STORE_STRIPED>
+    BlockStore;
+  typedef crystal::
+    BlockFlag<int32_t, BLOCK_THREADS, ITEMS_PER_THREAD, crystal::DataArrangement::Blocked>
+      BlockFlag;
+  typedef crystal::BlockShuffle<int32_t, BLOCK_THREADS, ITEMS_PER_THREAD> BlockShuffle;
+  typedef crystal::
+    BlockLoad<InputT, BLOCK_THREADS, ITEMS_PER_THREAD, crystal::DataArrangement::Striped>
+      BlockLoadInput;
+  typedef crystal::KernelConfig<BLOCK_THREADS, ITEMS_PER_THREAD> KernelConfigT;
 
+  // Shared memory
+  __shared__ typename BlockLoadStencil::TempStorage temp_load_stencil_storage;
+  __shared__ typename BlockScan::TempStorage temp_scan_storage;
+  __shared__ typename BlockStore::TempStorage temp_store_storage;
+  __shared__ typename BlockShuffle::TempStorage temp_shuffle_storage;
+  __shared__ CounterT write_offset;
+
+  // Thread memory
+  StencilT stencil_items[ITEMS_PER_THREAD];
+  int32_t flags[ITEMS_PER_THREAD];
+  int32_t prefix_sums[ITEMS_PER_THREAD];
+  InputT input_items[ITEMS_PER_THREAD];
+  int32_t num_selected = 0;
+  KernelConfigT config(blockIdx.x, num_in);
+
+  // Load stencil items and compute flags
+  if (__builtin_expect(!config.is_last_tile, 1))
+  {
+    BlockLoadStencil(temp_load_stencil_storage).Load(stencil + config.block_offset, stencil_items);
+    BlockFlag::SetFlags(stencil_items, predicate, flags);
+  }
+  else
+  {
+    BlockLoadStencil(temp_load_stencil_storage)
+      .Load(stencil + config.block_offset, stencil_items, config.num_tile_items);
+    BlockFlag::InitFlags(flags);
+    BlockFlag::SetFlags(stencil_items, predicate, flags, config.num_tile_items);
+  }
+
+  // Scan flags
+  BlockScan(temp_scan_storage).ExclusiveSum(flags, prefix_sums, num_selected);
+  if (threadIdx.x == 0)
+  {
+    write_offset = atomicAdd(num_out, num_selected);
+  }
+  cub::CTA_SYNC();
+
+  // Shuffle
+  BlockShuffle(temp_shuffle_storage)
+    .Shuffle<crystal::DataArrangement::Blocked,
+             crystal::DataArrangement::Striped,
+             crystal::ShuffleOperator::SetBlockItems>(flags, flags, prefix_sums, num_selected);
+
+  // Gathering load
+  BlockLoadInput::Gather(input + config.block_offset, flags, input_items, num_selected);
+
+  // Write compacted data
+  BlockStore(temp_store_storage).Store(output + write_offset, input_items, num_selected);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Sweep
+//--------------------------------------------------------------------------------------------------
+void SweepSelectivity()
+{
   // Initialize default input vector
+  std::default_random_engine rng(seed);
+  thrust::host_vector<int32_t> input_host(default_num_items);
+  thrust::sequence(input_host.begin(), input_host.end(), 0, 2);
+  std::shuffle(input_host.begin(), input_host.end(), rng);
   thrust::device_vector<int32_t> input(default_num_items);
-  thrust::counting_iterator<uint32_t> index_begin(0);
-  thrust::transform(index_begin,
-                    index_begin + default_num_items,
-                    input.begin(),
-                    RandUniformOp{-default_random_bound, default_random_bound + 1});
+  thrust::copy(input_host.begin(), input_host.end(), input.begin());
 
   // Initialize stencil vector
+  thrust::host_vector<int32_t> stencil_host(default_num_items);
+  thrust::sequence(stencil_host.begin(), stencil_host.end(), 0);
+  std::shuffle(stencil_host.begin(), stencil_host.end(), rng);
   thrust::device_vector<int32_t> stencil(default_num_items);
+  thrust::copy(stencil_host.begin(), stencil_host.end(), stencil.begin());
 
   // Initialize output buffers
   thrust::device_vector<int32_t> output(default_num_items);
 
-  // Allocate cub resources
-  thrust::device_vector<int32_t> num_out_cub_vector(1);
-  uint8_t *temp_storage = nullptr;
-  size_t temp_storage_bytes = 0;
-  cub::DeviceSelect::FlaggedIf(temp_storage,
-                               temp_storage_bytes,
-                               input.begin(),
-                               stencil.begin(),
-                               output.begin(),
-                               num_out_cub_vector.begin(),
-                               default_num_items,
-                               SelectOp{});
-  CubDebugExit(cudaMalloc(&temp_storage, temp_storage_bytes));
-
-  // Allocate crystal resources
-  uint8_t *temp_storage_crystal = nullptr;
-  size_t temp_storage_crystal_bytes = 0;
-  int32_t num_out = 0;
-  crystal::DeviceSelect::Select<block_threads, items_per_thread>(temp_storage_crystal,
-                                                                 temp_storage_crystal_bytes,
-                                                                 input.begin(),
-                                                                 stencil.begin(),
-                                                                 SelectOp{},
-                                                                 default_num_items,
-                                                                 output.begin(),
-                                                                 num_out);
-  CubDebugExit(cudaMalloc(&temp_storage_crystal, temp_storage_crystal_bytes));
-
-  for (auto inverse_selectivity : inverse_selectivities)
+  for (auto inverse_selectivity : possible_inverse_selectivities)
   {
-    std::cout << "Selectivity: " << (1 / static_cast<float>(inverse_selectivity)) << "\n";
+    std::cout << "Selectivity: " << (1.0f / static_cast<float>(inverse_selectivity)) << "\n";
 
-    // Populate stencil
-    thrust::counting_iterator<uint32_t> stencil_index_begin(0);
-    thrust::transform(stencil_index_begin,
-                      stencil_index_begin + default_num_items,
-                      stencil.begin(),
-                      RandUniformOp{0, inverse_selectivity});
-
-    // Crystal
-    crystal::DeviceSelect::Select<block_threads, items_per_thread>(temp_storage_crystal,
-                                                                   temp_storage_crystal_bytes,
-                                                                   input.begin(),
-                                                                   stencil.begin(),
-                                                                   SelectOp{},
-                                                                   default_num_items,
-                                                                   output.begin(),
-                                                                   num_out);
-
-    CubDebugExit(cudaDeviceSynchronize());
-
-    std::cout << "Finished crystal.\n";
-
-    // Cub
-    cub::DeviceSelect::FlaggedIf(temp_storage,
+    // Cub ordered compaction
+    thrust::device_vector<int32_t> num_out_cub_vector(1);
+    uint8_t* temp_storage_cub = nullptr;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceSelect::FlaggedIf(temp_storage_cub,
                                  temp_storage_bytes,
                                  input.begin(),
                                  stencil.begin(),
                                  output.begin(),
                                  num_out_cub_vector.begin(),
                                  default_num_items,
-                                 SelectOp{});
-
+                                 SelectOp{inverse_selectivity});
+    CubDebugExit(cudaMalloc(&temp_storage_cub, temp_storage_bytes));
+    cub::DeviceSelect::FlaggedIf(temp_storage_cub,
+                                 temp_storage_bytes,
+                                 input.begin(),
+                                 stencil.begin(),
+                                 output.begin(),
+                                 num_out_cub_vector.begin(),
+                                 default_num_items,
+                                 SelectOp{inverse_selectivity});
     CubDebugExit(cudaDeviceSynchronize());
 
-    std::cout << "Finished cub.\n";
-  }
+    // Crystal ordered compaction
+    uint8_t* temp_storage_crystal = nullptr;
+    temp_storage_bytes            = 0;
+    int32_t num_out               = 0;
+    crystal::DeviceSelect::Select<block_threads, items_per_thread>(temp_storage_crystal,
+                                                                   temp_storage_bytes,
+                                                                   input.begin(),
+                                                                   stencil.begin(),
+                                                                   SelectOp{inverse_selectivity},
+                                                                   default_num_items,
+                                                                   output.begin(),
+                                                                   num_out);
+    CubDebugExit(cudaMalloc(&temp_storage_crystal, temp_storage_bytes));
+    crystal::DeviceSelect::Select<block_threads, items_per_thread>(temp_storage_crystal,
+                                                                   temp_storage_bytes,
+                                                                   input.begin(),
+                                                                   stencil.begin(),
+                                                                   SelectOp{inverse_selectivity},
+                                                                   default_num_items,
+                                                                   output.begin(),
+                                                                   num_out);
+    CubDebugExit(cudaDeviceSynchronize());
 
-  // Free cub temp storage
-  if (temp_storage)
-  {
-    CubDebugExit(cudaFree(temp_storage));
-    temp_storage = nullptr;
+    // Crystal unordered compaction
+    thrust::device_vector<int32_t> num_out_crystal_vector(1);
+    int32_t blocks_in_grid =
+      cub::DivideAndRoundUp(default_num_items, block_threads * items_per_thread);
+    UnorderedSelectKernel<block_threads, items_per_thread>
+      <<<blocks_in_grid, block_threads>>>(input.begin(),
+                                          stencil.begin(),
+                                          SelectOp{inverse_selectivity},
+                                          default_num_items,
+                                          output.begin(),
+                                          thrust::raw_pointer_cast(num_out_crystal_vector.data()));
+    CubDebugExit(cudaDeviceSynchronize());
+
+    // Free explicitly allocated resources
+    if (temp_storage_cub)
+    {
+      CubDebugExit(cudaFree(temp_storage_cub));
+    }
+    if (temp_storage_crystal)
+    {
+      CubDebugExit(cudaFree(temp_storage_crystal));
+    }
   }
 }
 
 //--------------------------------------------------------------------------------------------------
 // Main
 //--------------------------------------------------------------------------------------------------
-int main(int argc, char **argv)
+int main(int argc, char** argv)
 {
   // Gather command-line args
   int32_t num_selectivities = 0;
@@ -161,10 +235,7 @@ int main(int argc, char **argv)
   }
 
   // Sweep selectivity
-  if (num_selectivities > 0)
-  {
-    SweepSelectivity(num_selectivities);
-  }
+  SweepSelectivity();
 
   return 0;
 }

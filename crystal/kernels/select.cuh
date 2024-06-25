@@ -9,7 +9,6 @@
 namespace crystal
 {
 
-// TODO: clean up usage of CounterT vs. int32_t
 template <int32_t BLOCK_THREADS,
           int32_t ITEMS_PER_THREAD,
           typename CounterT,
@@ -110,6 +109,7 @@ __global__ void SelectKernel(cub::ScanTileState<CounterT> tile_state,
   }
 
   // Shuffle flagged row ids (implicit synchronization barrier for write_offset)
+  // Reuse flags for row ids
   BlockShuffle(temp_shuffle_storage)
     .Shuffle<DataArrangement::Blocked, DataArrangement::Striped, ShuffleOperator::SetBlockItems>(
       flags,
